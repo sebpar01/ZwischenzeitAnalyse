@@ -18,12 +18,14 @@ Benötigte Pakete:
 """
 
 import os
+import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 
 
 # ------------------------------------------------------------
@@ -196,6 +198,312 @@ def calculate_analysis(
     return np.array(x), labels, result
 
 
+
+# ------------------------------------------------------------
+# Zusätzliche Sektoren-Tabelle
+# ------------------------------------------------------------
+
+def find_startnr_col(df):
+    """Findet die Startnummer-Spalte (Bib)."""
+    candidates = ["Startnr", "Startnummer", "Bib", "Bib Number", "Start-Nr"]
+    return next((c for c in candidates if c in df.columns), None)
+
+
+def calculate_sector_table_data(df, split_cols, run_name, selected_names):
+    """Berechnet Sektorzeiten, virtuelle Bestzeiten und Platzierungen."""
+    run_df = df[df["Lauf"] == run_name].copy()
+    run_df = run_df.drop_duplicates(subset=["Name"], keep="first")
+
+    finish_col = find_finish_col(df)
+    if not finish_col:
+        raise ValueError(
+            "Für die Sektoren-Tabelle wurde keine Laufzeit-/Zielzeit-Spalte gefunden. "
+            "Erwartet wird z. B. 'Laufzeit'."
+        )
+
+    startnr_col = find_startnr_col(df)
+    if not startnr_col:
+        raise ValueError(
+            "Die Startnummer-Spalte wurde nicht gefunden. "
+            "Bitte prüfe, ob sie in Excel 'Startnr' heißt."
+        )
+
+    nation_candidates = ["Nation", "NATION", "Nat", "NAT", "Country"]
+    nation_col = next((c for c in nation_candidates if c in df.columns), None)
+    if nation_col is None:
+        raise ValueError("Die Nation-Spalte wurde nicht gefunden. Erwartet wird 'Nation'.")
+
+    # Nur Zwischenzeiten berücksichtigen, für die zumindest ein
+    # ausgewählter Athlet einen Wert besitzt.
+    athletes = []
+    for name in selected_names:
+        rows = run_df[run_df["Name"] == name]
+        if rows.empty:
+            continue
+        row = rows.iloc[0]
+        cumulative = [0.0]
+        for col in split_cols:
+            value = pd.to_numeric(row[col], errors="coerce")
+            cumulative.append(float(value) if pd.notna(value) else np.nan)
+
+        finish = pd.to_numeric(row[finish_col], errors="coerce")
+        if pd.isna(finish):
+            # Ohne Zielzeit kann weder Gesamtplatz noch letzter Sektor
+            # zuverlässig berechnet werden.
+            continue
+
+        cumulative.append(float(finish))
+        sector_times = []
+        for i in range(len(cumulative) - 1):
+            start_time = cumulative[i]
+            end_time = cumulative[i + 1]
+            if pd.isna(start_time) or pd.isna(end_time):
+                sector_times.append(np.nan)
+            else:
+                sector_times.append(end_time - start_time)
+
+        athletes.append({
+            "name": name,
+            "bib": row[startnr_col],
+            "nation": str(row[nation_col]).strip() if pd.notna(row[nation_col]) else "",
+            "finish": float(finish),
+            "sector_times": sector_times,
+        })
+
+    if not athletes:
+        raise ValueError(
+            "Für die ausgewählten Athleten konnten keine vollständigen Laufzeiten gefunden werden."
+        )
+
+    # Bei unvollständigen Zwischenzeiten kann die Anzahl der Sektoren
+    # unterschiedlich sein. Für die Tabelle werden die vorhandenen
+    # Zwischenzeit-Spalten gemeinsam verwendet; fehlende Werte bleiben leer.
+    n_sectors = len(split_cols) + 1
+    for athlete in athletes:
+        athlete["sector_times"] = (athlete["sector_times"] + [np.nan] * n_sectors)[:n_sectors]
+
+    sector_bests = []
+    sector_ranks = {a["name"]: [] for a in athletes}
+    sector_gaps = {a["name"]: [] for a in athletes}
+
+    for sector_idx in range(n_sectors):
+        values = [a["sector_times"][sector_idx] for a in athletes]
+        valid = [v for v in values if pd.notna(v)]
+        best = min(valid) if valid else np.nan
+        sector_bests.append(best)
+
+        for athlete in athletes:
+            value = athlete["sector_times"][sector_idx]
+            if pd.isna(value) or pd.isna(best):
+                sector_gaps[athlete["name"]].append(np.nan)
+                sector_ranks[athlete["name"]].append(np.nan)
+            else:
+                sector_gaps[athlete["name"]].append(value - best)
+                # Competition ranking: 1, 2, 2, 4
+                rank = 1 + sum(v < value for v in valid)
+                sector_ranks[athlete["name"]].append(rank)
+
+    virtual_total = float(np.nansum(sector_bests))
+
+    # Gesamtplatzierung nach tatsächlicher Ziel-/Laufzeit.
+    athletes.sort(key=lambda a: a["finish"])
+    previous_time = None
+    current_rank = 0
+    for index, athlete in enumerate(athletes, start=1):
+        if previous_time is None or not np.isclose(athlete["finish"], previous_time):
+            current_rank = index
+        athlete["overall_rank"] = current_rank
+        previous_time = athlete["finish"]
+
+    return {
+        "athletes": athletes,
+        "sector_bests": sector_bests,
+        "sector_gaps": sector_gaps,
+        "sector_ranks": sector_ranks,
+        "virtual_total": virtual_total,
+        "sector_labels": [f"Sektor {i + 1}" for i in range(n_sectors)],
+    }
+
+
+def format_seconds(value, total=False):
+    if pd.isna(value):
+        return "–"
+    value = float(value)
+    if value >= 60 or total:
+        minutes = int(value // 60)
+        seconds = value - minutes * 60
+        return f"{minutes}:{seconds:06.3f}"
+    return f"{value:.3f}"
+
+
+def plot_sector_table(table_data, title, output_path, show=True):
+    """Erstellt eine PNG-Tabelle im Stil der bereitgestellten Ergebnisübersicht."""
+    athletes = table_data["athletes"]
+    sector_bests = table_data["sector_bests"]
+    sector_gaps = table_data["sector_gaps"]
+    sector_ranks = table_data["sector_ranks"]
+    n_sectors = len(sector_bests)
+
+    # Spaltenbreiten: Platz, Bib, Name, Nation, je Sektor Zeit/Rückst./Rang, Gesamt.
+    widths = [0.55, 0.62, 2.15, 0.72]
+    for _ in range(n_sectors):
+        widths.extend([0.86, 0.90, 0.58])
+    widths.append(0.95)
+    x_edges = np.cumsum([0] + widths)
+    total_width = x_edges[-1]
+
+    header_h = 0.48
+    subheader_h = 0.43
+    row_h = 0.48
+    n_rows = len(athletes) + 1  # virtuelle Bestzeit + Athleten
+    total_height = header_h + subheader_h + n_rows * row_h
+
+    fig_width = max(12, total_width * 0.82)
+    fig_height = max(3.5, total_height * 0.52 + 0.9)
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    ax.set_xlim(0, total_width)
+    ax.set_ylim(0, total_height)
+    ax.axis("off")
+
+    # Dezente Tabellenfarben ähnlich dem Beispiel.
+    header_color = "#b7d3ec"
+    group_header_color = "#d8e8f5"
+    virtual_color = "#e5f3e9"
+    grid_color = "#b8b8b8"
+
+    def cell(x0, y0, w, h, text, facecolor="white", color="black",
+             fontsize=8.5, weight="normal", ha="center", pad=0.05):
+        rect = plt.Rectangle((x0, y0), w, h, facecolor=facecolor,
+                             edgecolor=grid_color, linewidth=0.45)
+        ax.add_patch(rect)
+        tx = x0 + (pad if ha == "left" else w / 2)
+        ax.text(tx, y0 + h / 2, str(text), ha=ha, va="center",
+                fontsize=fontsize, color=color, fontweight=weight,
+                clip_on=True)
+
+    # Titel
+    ax.text(total_width / 2, total_height + 0.12, title,
+            ha="center", va="bottom", fontsize=11, fontweight="bold")
+
+    # Kopfzeile mit zusammengefassten Sektorüberschriften.
+    y_group = total_height - header_h
+    for i, label in enumerate(["Platz", "Bib", "Name", "Nation"]):
+        cell(x_edges[i], y_group - subheader_h, widths[i], header_h + subheader_h,
+             label, facecolor=header_color, weight="bold", fontsize=8.5)
+
+    for sector_idx in range(n_sectors):
+        start_col = 4 + sector_idx * 3
+        x0 = x_edges[start_col]
+        w = sum(widths[start_col:start_col + 3])
+        cell(x0, y_group, w, header_h, f"Sektor {sector_idx + 1}",
+             facecolor=group_header_color, weight="bold", fontsize=9)
+        for offset, sublabel in enumerate(["Zeit", "Rückst.", "Rang"]):
+            col = start_col + offset
+            cell(x_edges[col], y_group - subheader_h, widths[col], subheader_h,
+                 sublabel, facecolor=header_color, weight="bold", fontsize=8)
+
+    total_col = len(widths) - 1
+    cell(x_edges[total_col], y_group - subheader_h, widths[total_col],
+         header_h + subheader_h, "Gesamt", facecolor=header_color,
+         weight="bold", fontsize=8.5)
+
+    # Virtuelle Bestzeit-Zeile.
+    y = y_group - subheader_h - row_h
+    cell(x_edges[0], y, widths[0], row_h, "", facecolor=virtual_color)
+    cell(x_edges[1], y, widths[1], row_h, "", facecolor=virtual_color)
+    cell(x_edges[2], y, widths[2], row_h, "Virtuelle Bestzeit",
+         facecolor=virtual_color, ha="left", weight="bold", fontsize=8)
+    cell(x_edges[3], y, widths[3], row_h, "", facecolor=virtual_color)
+
+    for sector_idx, best in enumerate(sector_bests):
+        start_col = 4 + sector_idx * 3
+        cell(x_edges[start_col], y, widths[start_col], row_h,
+             format_seconds(best), facecolor=virtual_color,
+             color="#00843d", weight="bold")
+        # Rückstand und Rang bleiben bei der virtuellen Bestzeit leer.
+
+    cell(x_edges[total_col], y, widths[total_col], row_h,
+         format_seconds(table_data["virtual_total"], total=True),
+         facecolor="#16833b", color="white", weight="bold")
+
+    # Athleten-Zeilen.
+    max_gap = max(
+        [g for values in sector_gaps.values() for g in values if pd.notna(g)] + [0.01]
+    )
+    max_total_gap = max([a["finish"] - min(x["finish"] for x in athletes) for a in athletes] + [0.01])
+
+    for row_idx, athlete in enumerate(athletes, start=1):
+        y = y_group - subheader_h - (row_idx + 1) * row_h
+        base_bg = "#f0f0f0" if row_idx % 2 == 0 else "#ffffff"
+        cell(x_edges[0], y, widths[0], row_h, athlete["overall_rank"], facecolor=base_bg)
+        bib = athlete["bib"]
+        if pd.isna(bib):
+            bib_text = "–"
+        elif isinstance(bib, (float, np.floating)) and float(bib).is_integer():
+            bib_text = str(int(bib))
+        else:
+            bib_text = str(bib)
+        cell(x_edges[1], y, widths[1], row_h, bib_text, facecolor=base_bg)
+        cell(x_edges[2], y, widths[2], row_h, athlete["name"],
+             facecolor=base_bg, ha="left", fontsize=8)
+        cell(x_edges[3], y, widths[3], row_h, athlete["nation"],
+             facecolor=base_bg, fontsize=8)
+
+        for sector_idx in range(n_sectors):
+            start_col = 4 + sector_idx * 3
+            sector_time = athlete["sector_times"][sector_idx]
+            gap = sector_gaps[athlete["name"]][sector_idx]
+            rank = sector_ranks[athlete["name"]][sector_idx]
+
+            is_best = pd.notna(gap) and np.isclose(gap, 0.0)
+            time_bg = "#e3f2e7" if is_best else base_bg
+            time_color = "#00843d" if is_best else "black"
+            cell(x_edges[start_col], y, widths[start_col], row_h,
+                 format_seconds(sector_time), facecolor=time_bg, color=time_color)
+
+            if pd.isna(gap):
+                gap_bg = base_bg
+                gap_text = "–"
+            else:
+                intensity = min(float(gap) / max_gap, 1.0)
+                # Weiß bis kräftiges Rot.
+                gap_bg = (1.0, 1.0 - 0.48 * intensity, 1.0 - 0.48 * intensity)
+                gap_text = f"{gap:.3f}"
+            cell(x_edges[start_col + 1], y, widths[start_col + 1], row_h,
+                 gap_text, facecolor=gap_bg)
+
+            rank_bg = "#e3f2e7" if pd.notna(rank) and rank == 1 else base_bg
+            rank_color = "#00843d" if pd.notna(rank) and rank == 1 else "black"
+            rank_text = "–" if pd.isna(rank) else int(rank)
+            cell(x_edges[start_col + 2], y, widths[start_col + 2], row_h,
+                 rank_text, facecolor=rank_bg, color=rank_color)
+
+        total_gap = athlete["finish"] - min(a["finish"] for a in athletes)
+        intensity = min(total_gap / max_total_gap, 1.0) if max_total_gap > 0 else 0
+        total_bg = (1.0, 1.0 - 0.55 * intensity, 1.0 - 0.55 * intensity)
+        cell(x_edges[total_col], y, widths[total_col], row_h,
+             format_seconds(athlete["finish"], total=True),
+             facecolor=total_bg, weight="bold")
+
+    # Markante schwarze Trennlinien zwischen den Sektoren.
+    bottom_y = 0
+    # Linien laufen über die gesamte Tabellenhöhe, einschließlich der
+    # oberen Sektor-Überschriften. Dadurch werden die Sektoren bereits
+    # in der obersten Kopfzeile klar voneinander abgegrenzt.
+    top_y = total_height
+    for boundary_col in [4 + i * 3 for i in range(n_sectors)] + [total_col]:
+        x = x_edges[boundary_col]
+        ax.plot([x, x], [bottom_y, top_y], color="black", linewidth=1.8, zorder=10)
+    ax.plot([0, total_width], [y_group - subheader_h - row_h,
+                               y_group - subheader_h - row_h],
+            color="black", linewidth=1.5, zorder=10)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    if show:
+        plt.show()
+    return fig
+
 def get_event_title(df, run_name, discipline_col):
     """
     Erstellt den Titel aus Lauf + Disziplin.
@@ -224,7 +532,7 @@ def get_event_title(df, run_name, discipline_col):
 # Diagramm
 # ------------------------------------------------------------
 
-def plot_analysis(x, labels, result, reference_name, title, output_path=None):
+def plot_analysis(x, labels, result, reference_name, title, output_path=None, show=True):
     fig, ax = plt.subplots(figsize=(14, 7))
 
     # Referenz = 0
@@ -415,7 +723,104 @@ def plot_analysis(x, labels, result, reference_name, title, output_path=None):
     if output_path:
         fig.savefig(output_path, dpi=200, bbox_inches="tight")
 
-    plt.show()
+    if show:
+        plt.show()
+    return fig
+
+
+# ------------------------------------------------------------
+# PDF-Export
+# ------------------------------------------------------------
+
+def create_analysis_pdf(line_fig, sector_fig, pdf_path, event_title, reference_name):
+    """Erstellt einen zweiseitigen A4-Querformatbericht mit echten Vektorgrafiken.
+
+    Die Matplotlib-Figuren werden direkt über den PDF-Backend gespeichert.
+    Linien, Flächen, Tabellenzellen, Texte und Achsen bleiben dadurch
+    Vektorelemente und bleiben auch beim starken Zoomen scharf.
+    """
+    page_size = (11.69, 8.27)  # A4 quer in Zoll
+    pages = [
+        (line_fig, "Zeitdifferenzen", f"Referenz: {reference_name}"),
+        (sector_fig, "Sektorenanalyse", "Sektorzeiten, Rückstände und Ränge"),
+    ]
+
+    with PdfPages(pdf_path) as pdf:
+        info = pdf.infodict()
+        info["Title"] = str(event_title)
+        info["Subject"] = "Zwischenzeitenanalyse – Zeitdifferenzen und Sektoren"
+        info["Author"] = "Rodel Austria"
+
+        for chart_fig, section_title, subtitle in pages:
+            old_size = chart_fig.get_size_inches().copy()
+            old_positions = [(ax, ax.get_position().frozen()) for ax in chart_fig.axes]
+            old_text_sizes = []
+            header_artists = []
+            try:
+                # Feste A4-Querformatseite; die ursprünglichen PNG-Exporte
+                # wurden bereits vorher erstellt und bleiben unverändert.
+                chart_fig.set_size_inches(*page_size, forward=True)
+
+                # Platz für einen dezenten, einheitlichen PDF-Kopfbereich.
+                for ax, _ in old_positions:
+                    if section_title == "Sektorenanalyse":
+                        # Die Tabelle behält ihre ursprünglichen Proportionen.
+                        # So werden Zellen und Texte nicht horizontal gestaucht.
+                        ax.set_position([0.04, 0.18, 0.92, 0.68])
+                        ax.set_aspect("equal", adjustable="box")
+                        # Die Tabelle wird proportional auf die Seitenbreite
+                        # skaliert. Schriftgrößen werden im gleichen Verhältnis
+                        # verkleinert, damit alle Werte in ihren Zellen bleiben.
+                        text_scale = min(1.0, (11.69 * 0.92) / old_size[0])
+                        for text_artist in ax.texts:
+                            old_text_sizes.append((text_artist, text_artist.get_fontsize()))
+                            text_artist.set_fontsize(text_artist.get_fontsize() * text_scale)
+                            if text_artist.get_position()[1] > ax.get_ylim()[1]:
+                                text_artist.set_visible(False)
+                    else:
+                        # Linienanalyse minimal verkleinert und etwas nach rechts
+                        # gesetzt. Dadurch erhält die y-Achsenbeschriftung mehr
+                        # Abstand zum linken Seitenrand, ohne das Layout merklich
+                        # zu verändern.
+                        ax.set_position([0.09, 0.16, 0.84, 0.70])
+                        # Der PDF-Kopf enthält bereits den Veranstaltungstitel.
+                        ax.set_title("")
+
+                header_artists.append(chart_fig.text(
+                    0.045, 0.965, str(event_title),
+                    ha="left", va="top", fontsize=13,
+                    fontweight="bold", color="#171717"
+                ))
+                header_artists.append(chart_fig.text(
+                    0.955, 0.965, section_title,
+                    ha="right", va="top", fontsize=10,
+                    fontweight="bold", color="#333333"
+                ))
+                header_artists.append(chart_fig.text(
+                    0.955, 0.925, subtitle,
+                    ha="right", va="top", fontsize=8.5, color="#555555"
+                ))
+                header_artists.append(chart_fig.add_artist(plt.Line2D(
+                    [0.045, 0.955], [0.895, 0.895],
+                    transform=chart_fig.transFigure,
+                    color="#222222", linewidth=0.8
+                )))
+
+                # Direkter PDF-Export der Figure: kein PNG-Zwischenschritt.
+                # Matplotlib schreibt die Grafikobjekte als PDF-Vektoren.
+                pdf.savefig(chart_fig, bbox_inches=None)
+            finally:
+                for artist in header_artists:
+                    try:
+                        artist.remove()
+                    except Exception:
+                        pass
+                chart_fig.set_size_inches(*old_size, forward=True)
+                for ax, position in old_positions:
+                    ax.set_position(position)
+                for text_artist, fontsize in old_text_sizes:
+                    text_artist.set_fontsize(fontsize)
+                    text_artist.set_visible(True)
 
 
 # ------------------------------------------------------------
@@ -730,18 +1135,50 @@ class AnalysisApp:
                 f"Zeitdifferenzen | Referenz: {reference_name}"
             )
 
-            plot_analysis(
+            line_fig = plot_analysis(
                 x,
                 labels,
                 result,
                 reference_name,
                 title,
-                output_path
+                output_path,
+                show=False
             )
+
+            # Zweite Auswertung: Sektoren-Tabelle mit virtueller Bestzeit.
+            sector_data = calculate_sector_table_data(
+                self.df,
+                self.split_cols,
+                run_name,
+                selected_names
+            )
+            sector_output_path = (
+                f"{base}_Sektoren_{run_name.replace(' ', '_')}.png"
+            )
+            sector_fig = plot_sector_table(
+                sector_data,
+                event_title,
+                sector_output_path,
+                show=False
+            )
+
+            # PDF mit zwei Seiten: 1. Linienanalyse, 2. Sektoren-Tabelle.
+            pdf_output_path = f"{base}_Analyse_{run_name.replace(' ', '_')}.pdf"
+            create_analysis_pdf(
+                line_fig, sector_fig, pdf_output_path, event_title, reference_name
+            )
+
+            # Grafiken wie bisher zusätzlich am Bildschirm anzeigen.
+            plt.show()
+            plt.close(line_fig)
+            plt.close(sector_fig)
 
             messagebox.showinfo(
                 "Analyse fertig",
-                f"Diagramm wurde gespeichert:\n\n{output_path}"
+                "Beide Auswertungen wurden gespeichert:\n\n"
+                f"1. Diagramm:\n{output_path}\n\n"
+                f"2. Sektoren-Tabelle:\n{sector_output_path}\n\n"
+                f"3. PDF-Bericht (2 Seiten):\n{pdf_output_path}"
             )
 
         except Exception as e:
